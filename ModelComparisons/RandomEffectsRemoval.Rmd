@@ -15,9 +15,6 @@ Blablabla
 ```{r message=FALSE}
 library(tidyverse)
 library(brms)
-library(binom)
-library(ICCbin)
-library(meta)
 library(lme4)
 library(here)
 library(knitr)
@@ -25,8 +22,9 @@ library(bridgesampling)
 library(ggeffects)
 library(MCMCpack)
 library(coda)
+library(beepr)
 library(future); library(future.apply); library(furrr)
-plan(multiprocess, workers = 4)
+plan(multiprocess, workers = 8)
 
 #source("StatTools.R")
 #source("geom_flat_violin.R")
@@ -77,9 +75,9 @@ data.null_none <- data.base %>%
            rnorm(n_labs*n_per_lab, condition*condition_re.labs[lab], re.sigma))
 ```
 
-# Null Model Selection Method and Bayes Factor
+# Null Model Selection Method and Hypothesis Testing
 
-Here we will consider three different strategies of selecting a null model to obtain a Bayes factor from the model comparison.
+Here we will consider three different strategies of selecting a null model to obtain a value for hypothesis testing (Bayes factor for Bayesian analysis, or $p$-value for Sample Theory Based analysis) from the model comparison.
 
 A first approach is to remove both the main and random effect of the parameter to be tested. In our case, it would result in a null model defined as follows:
 
@@ -108,20 +106,21 @@ Although this method would seem the safest option, it has the downfall of requir
 
 # Simulations
 
-Below we run simulations on the data structure and models presented above, and present the results by structure type (`null_both`, `null_re`, `null_fe`, `null_none`) and model comparison (A, B, C1, C2). Notably, we present the Bayes factors for both model comparisons C1 (against the full model) and C2 (against C1) to assess the quality of information brought by the additional model comparison. We present the Bayes factors distributions visually and check the rate of Type I and Type II errors with the comonly used threshold of a Bayes factor greater than 3 (or smaller than 1/3) as being worth noting.
+Below we run simulations on the data structure and models presented above, and present the results by structure type (`null_both`, `null_re`, `null_fe`, `null_none`) and model comparison (A, B, C1, C2). Notably, we present respectively the $b$- and $p$-values for both model comparisons C1 (against the full model) and C2 (against C1) to assess the quality of information brought by the additional model comparison. We present the $b$- and $p$-values distributions visually and check the rate of Type I and Type II errors with the commonly used thresholds of (a) a Bayes factor greater than 3 (or smaller than 1/3) as being worth noting and (b) a $p$-value lesser than .05 as being significant.
 
-```{r sims}
+## Bayesian simulations and results
+
+```{r bayes_sims}
 save_path <- "simulation_results/ranef_removal/"
+filename.bf <- paste0(save_path, "bayes_factors.csv")
 # Run simulations ================================
 # Run bayesian models, bridge-sample, then
 # save bf, parameter estimates, and HPDIs, to csv
 # Running the models takes several hours per iteration
 n_sims <- 4
-run_models <- T
-t <- Sys.time()
+run_models <- F
 if(run_models){
-  ## Initialise filename for bf
-  filename.bf <- paste0(save_path, "bayes_factors.csv")
+  t <- Sys.time()
   ## Initialise simulation rng seeds
   n_previous <- ifelse(file.exists(filename.bf), length(read_lines(filename.bf))-1, 0) / 16
   ## Initialise models with any data (they will be updated with the appropriate datasets)
@@ -147,7 +146,7 @@ if(run_models){
                                  max_treedepth = 20))
   model.C2 <- NULL # The null model for C2 is the same as A, but needs to be compared to C1
   ## Define single simulation function
-  sims <- function(seed, data.type){
+  sims.brms <- function(seed, data.type){
     set.seed(seed)
     ### Generate dataset
     data.base <- tibble(lab = rep(1:n_labs, each = n_per_lab),
@@ -190,38 +189,128 @@ if(run_models){
     return(bf)
   }
   ## Create aliases for easier use of purrr::map functions
-  sims.null_both <- function(seed){sims(seed, "null_both")}
-  sims.null_re <- function(seed){sims(seed, "null_re")}
-  sims.null_fe <- function(seed){sims(seed, "null_fe")}
-  sims.null_none <- function(seed){sims(seed, "null_none")}
+  sims.brms.null_both <- function(seed){sims.brms(seed, "null_both")}
+  sims.brms.null_re <- function(seed){sims.brms(seed, "null_re")}
+  sims.brms.null_fe <- function(seed){sims.brms(seed, "null_fe")}
+  sims.brms.null_none <- function(seed){sims.brms(seed, "null_none")}
   ## Get new Bayes factors
   ### For data.null_both
   bf <- future_map_dfr(n_previous + 1:n_sims,
-                       possibly(sims.null_both, NA),
+                       possibly(sims.brms.null_both, NA),
                        .progress = T)
   bf %>% mutate(data_structure = "null_both") %>%
     write_csv(filename.bf, append = file.exists(filename.bf))
   ### For data.null_re
   bf <- future_map_dfr(n_previous + 1:n_sims,
-                       possibly(sims.null_re, NA),
+                       possibly(sims.brms.null_re, NA),
                        .progress = T)
   bf %>% mutate(data_structure = "null_re") %>%
     write_csv(filename.bf, append = T)
   ### For data.null_fe
   bf <- future_map_dfr(n_previous + 1:n_sims,
-                       possibly(sims.null_fe, NA),
+                       possibly(sims.brms.null_fe, NA),
                        .progress = T)
   bf %>% mutate(data_structure = "null_fe") %>%
     write_csv(filename.bf, append = T)
   ### For data.null_none
   bf <- future_map_dfr(n_previous + 1:n_sims,
-                       possibly(sims.null_none, NA),
+                       possibly(sims.brms.null_none, NA),
                        .progress = T)
   bf %>% mutate(data_structure = "null_none") %>%
     write_csv(filename.bf, append = T)
+  ## Check run time
+  t_total <- Sys.time() - t
   beep(8)
 }
-t_total <- Sys.time() - t
-## Read Bayes factors
-bf <- read_csv(paste0(save_path, "bayes_factors.csv"))
+# Read Bayes factors
+#bf <- read_csv(filename.bf)
+```
+
+## Sample Theory Based simulations and results
+
+```{r stb_sims}
+save_path <- "simulation_results/ranef_removal/"
+filename.pv <- paste0(save_path, "p_values.csv")
+# Run simulations ================================
+n_sims <- 1000
+run_models <- F
+t <- Sys.time()
+if(run_models){
+  ## Initialise simulation rng seeds
+  n_previous <- ifelse(file.exists(filename.pv), length(read_lines(filename.pv))-1, 0) / 16
+  ## Define single simulation function
+  sims.lmer <- function(seed, data.type){
+    set.seed(seed)
+    ### Generate dataset
+    data.base <- tibble(lab = rep(1:n_labs, each = n_per_lab),
+                        condition = rep(c(0,1), each = n_per_lab/2, times = n_labs))
+    df <- switch(data.type,
+                 null_both = data.base %>%
+                   mutate(obs = rnorm(n_labs*n_per_lab, 0, fe.sigma)),
+                 null_re = data.base %>%
+                   mutate(obs = rnorm(n_labs*n_per_lab, condition*condition_fe.mu, fe.sigma)),
+                 null_fe = data.base %>%
+                   mutate(obs = rnorm(n_labs*n_per_lab, 0, fe.sigma) +
+                            rnorm(n_labs*n_per_lab, condition*condition_re.labs[lab], re.sigma)),
+                 null_none <- data.base %>%
+                   mutate(obs = rnorm(n_labs*n_per_lab, condition*condition_fe.mu, fe.sigma) +
+                            rnorm(n_labs*n_per_lab, condition*condition_re.labs[lab], re.sigma))
+    )
+    ### Run models
+    m.full <- lmer(obs ~ 1 + condition + (1 + condition | lab), data = df)
+    m.A <- lmer(obs ~ 1 + (1  | lab), data = df)
+    m.B <- lmer(obs ~ 1 + (1 + condition | lab), data = df)
+    m.C1 <- lmer(obs ~ 1 + condition + (1 | lab), data = df)
+    m.C2 <- NULL # The null model for C2 is the same as A, but needs to be compared to C1
+    ### p-values
+    pv.A <- anova(m.A, m.full)$`Pr(>Chisq)`[2]
+    pv.B <- anova(m.B, m.full)$`Pr(>Chisq)`[2]
+    pv.C1 <- anova(m.C1, m.full)$`Pr(>Chisq)`[2]
+    pv.C2 <- anova(m.A, m.C1)$`Pr(>Chisq)`[2]
+    ### Combine p-values into tibble with null model information
+    pv <- tribble(
+      ~p.value, ~null_model,
+      pv.A,     "A",
+      pv.B,     "B",
+      pv.C1,    "C1",
+      pv.C2,    "C2"
+    )
+    return(pv)
+  }
+  ## Create aliases for easier use of purrr::map functions
+  sims.lmer.null_both <- function(seed){sims.lmer(seed, "null_both")}
+  sims.lmer.null_re <- function(seed){sims.lmer(seed, "null_re")}
+  sims.lmer.null_fe <- function(seed){sims.lmer(seed, "null_fe")}
+  sims.lmer.null_none <- function(seed){sims.lmer(seed, "null_none")}
+  ## Get new Bayes factors
+  ### For data.null_both
+  pv <- future_map_dfr(n_previous + 1:n_sims,
+                       possibly(sims.lmer.null_both, NA),
+                       .progress = T)
+  pv %>% mutate(data_structure = "null_both") %>%
+    write_csv(filename.pv, append = file.exists(filename.bf))
+  ### For data.null_re
+  pv <- future_map_dfr(n_previous + 1:n_sims,
+                       possibly(sims.lmer.null_re, NA),
+                       .progress = T)
+  pv %>% mutate(data_structure = "null_re") %>%
+    write_csv(filename.pv, append = T)
+  ### For data.null_fe
+  pv <- future_map_dfr(n_previous + 1:n_sims,
+                       possibly(sims.lmer.null_fe, NA),
+                       .progress = T)
+  pv %>% mutate(data_structure = "null_fe") %>%
+    write_csv(filename.pv, append = T)
+  ### For data.null_none
+  pv <- future_map_dfr(n_previous + 1:n_sims,
+                       possibly(sims.lmer.null_none, NA),
+                       .progress = T)
+  pv %>% mutate(data_structure = "null_none") %>%
+    write_csv(filename.pv, append = T)
+  ## Check run time
+  t_total <- Sys.time() - t
+  beep(8)
+}
+# Read p-values
+pf <- read_csv(filename.pv)
 ```
