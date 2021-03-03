@@ -1,0 +1,227 @@
+---
+title: "Random Effects Removal in Model Comparisons"
+author: "Arthur Capelier-Mourguy"
+date: "20/02/2021"
+abstract: "This document assess the consequences of removing or not random effects when using model comparisons, depending on the structure of the data and the true effects (within and/or between groups) present."
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Introduction
+
+Blablabla
+
+```{r message=FALSE}
+library(tidyverse)
+library(brms)
+library(binom)
+library(ICCbin)
+library(meta)
+library(lme4)
+library(here)
+library(knitr)
+library(bridgesampling)
+library(ggeffects)
+library(MCMCpack)
+library(coda)
+library(future); library(future.apply); library(furrr)
+plan(multiprocess, workers = 4)
+
+#source("StatTools.R")
+#source("geom_flat_violin.R")
+
+theme_set(theme_bw(base_size = 10))
+set.seed(705)
+
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+# Data Structure
+
+We simulate data with a variable of interest `obs`, multiple `lab` groups, and an effect of interest `condition`. To simplify matters, we keep a constant number of data points per lab per condition, and assume that `condition` is a between-subject measure. Thus, the statistical model we consider is as follows:
+
+```
+obs ~ 1 + condition + (1 + condition | lab)
+```
+
+We create different scenarios in which the effect of `condition` is either inconsistent overall (i.e. a true null effect of `condition` overall and in each `lab`, coded below as `null_both`), consistent overall with no `lab`-specific variance (i.e. a 'significant' main effect but a null random effect of `condition`, coded below as `null_re`), consistent for each lab but overall inconsistent (i.e. a null main effect but a 'significant' random effect of `condition`, coded below as `null_fe`), or consistent overall and for each lab (i.e. 'significant' fixed and random effects of `condition`, coded below as `null_none`). Importantly, we do not want the `lab`-specific effects to result in a non-zero overall effect, thus when simulating those effects we must make sure they all add up to zero.
+
+```{r data_sims}
+# Main variables -- tweak here if necessary
+n_per_lab <- 24
+n_labs <- 20
+condition_fe.mu <- .5
+fe.sigma <- .2
+re.sigma <- .2
+condition_re.labs <- rnorm(n_labs-1, .3, .2) %>% pmax(.05) %>% # Assure a non-zero effect for all labs
+  sort() %>% {.*rep_len(c(-1,1), n_labs-1)} %>% # Prepare an overall null mean across labs
+  {c(., -sum(.))} # Corrects the mean to zero with the final lab value
+
+# Generate datasets
+data.base <- tibble(lab = rep(1:n_labs, each = n_per_lab),
+                    condition = rep(c(0,1), each = n_per_lab/2, times = n_labs))
+## Both effects null
+data.null_both <- data.base %>%
+  mutate(obs = rnorm(n_labs*n_per_lab, 0, fe.sigma))
+## Random effect null, fixed effect non-null
+data.null_re <- data.base %>%
+  mutate(obs = rnorm(n_labs*n_per_lab, condition*condition_fe.mu, fe.sigma))
+## Fixed effect null, random effect non-null
+data.null_fe <- data.base %>%
+  mutate(obs = rnorm(n_labs*n_per_lab, 0, fe.sigma) +
+           rnorm(n_labs*n_per_lab, condition*condition_re.labs[lab], re.sigma))
+## Both effects non-null
+data.null_none <- data.base %>%
+  mutate(obs = rnorm(n_labs*n_per_lab, condition*condition_fe.mu, fe.sigma) +
+           rnorm(n_labs*n_per_lab, condition*condition_re.labs[lab], re.sigma))
+```
+
+# Null Model Selection Method and Bayes Factor
+
+Here we will consider three different strategies of selecting a null model to obtain a Bayes factor from the model comparison.
+
+A first approach is to remove both the main and random effect of the parameter to be tested. In our case, it would result in a null model defined as follows:
+
+```
+obs ~ 1 + (1 | lab)                                                            (A)
+```
+
+The rationale behind this approach is that a model should not have a random effect without its associated main effect. This is because random effects are designed to be centred, merely deviation from the general trend represented by the main effect. As such, random effects would not make sense without their main effect if the true effect was indeed non-null. However, this approach also has flaws, as we will see below.
+
+A second approach is to remove the main effect to be tested without removing its associated random effect. In other words, the null model to compare to the full model would be as follows:
+
+```
+obs ~ 1 + (1 + condition | lab)                                                (B)
+```
+
+Here we want to be sure that the Bayes factor reflects only the overall effect of `condition`, without confounding it with the `lab`-specific effect it could have. It is indeed possible to observe an overall true null effect that would result from non-null effect in each lab in opposite direction cancelling each other. In that case, this second method would correctly indicate the absence of a general effect of `condition`, when the first method would showcase the existing `lab`-specific effect, despite the lack of a general non-null trend. The only problem with this method is of course the presence in the model of a random effect without its associated main effect. This has no consequence when there is a true null effect, but might become an issue when the effect of `condition` is non-null.
+
+Finally, a third solution is to iteratively remove both the random and fixed effect, in that order, to separately compute the importance of each, while never having an improper model.
+
+```
+obs ~ 1 + condition + (1 | lab)                                               (C1)
+obs ~ 1 + (1 | lab)                                                           (C2)
+```
+
+Although this method would seem the safest option, it has the downfall of requiring double the amount of computational power, which can be critical when dealing with large datasets or more complex models. Hence, it is important to assess the necessity of using this method over the first two, and to assess which of the first two is the more appropriate in terms of Type I and Type II errors.
+
+# Simulations
+
+Below we run simulations on the data structure and models presented above, and present the results by structure type (`null_both`, `null_re`, `null_fe`, `null_none`) and model comparison (A, B, C1, C2). Notably, we present the Bayes factors for both model comparisons C1 (against the full model) and C2 (against C1) to assess the quality of information brought by the additional model comparison. We present the Bayes factors distributions visually and check the rate of Type I and Type II errors with the comonly used threshold of a Bayes factor greater than 3 (or smaller than 1/3) as being worth noting.
+
+```{r sims}
+save_path <- "simulation_results/ranef_removal/"
+# Run simulations ================================
+# Run bayesian models, bridge-sample, then
+# save bf, parameter estimates, and HPDIs, to csv
+# Running the models takes several hours per iteration
+n_sims <- 4
+run_models <- T
+t <- Sys.time()
+if(run_models){
+  ## Initialise filename for bf
+  filename.bf <- paste0(save_path, "bayes_factors.csv")
+  ## Initialise simulation rng seeds
+  n_previous <- ifelse(file.exists(filename.bf), length(read_lines(filename.bf))-1, 0) / 16
+  ## Initialise models with any data (they will be updated with the appropriate datasets)
+  model.full <- brm(obs ~ 1 + condition + (1 + condition | lab),
+                    data = data.null_both, family = gaussian,
+                    iter = 5000, future = T, save_all_pars = T,
+                    control = list(adapt_delta = .9999,
+                                   max_treedepth = 20))
+  model.A <- brm(obs ~ 1 + (1  | lab),
+                 data = data.null_both, family = gaussian,
+                 iter = 5000, future = T, save_all_pars = T,
+                 control = list(adapt_delta = .9999,
+                                max_treedepth = 20))
+  model.B <- brm(obs ~ 1 + (1 + condition | lab),
+                 data = data.null_both, family = gaussian,
+                 iter = 5000, future = T, save_all_pars = T,
+                 control = list(adapt_delta = .9999,
+                                max_treedepth = 20))
+  model.C1 <- brm(obs ~ 1 + condition + (1 | lab),
+                  data = data.null_both, family = gaussian,
+                  iter = 5000, future = T, save_all_pars = T,
+                  control = list(adapt_delta = .9999,
+                                 max_treedepth = 20))
+  model.C2 <- NULL # The null model for C2 is the same as A, but needs to be compared to C1
+  ## Define single simulation function
+  sims <- function(seed, data.type){
+    set.seed(seed)
+    ### Generate dataset
+    data.base <- tibble(lab = rep(1:n_labs, each = n_per_lab),
+                        condition = rep(c(0,1), each = n_per_lab/2, times = n_labs))
+    df <- switch(data.type,
+                 null_both = data.base %>%
+                   mutate(obs = rnorm(n_labs*n_per_lab, 0, fe.sigma)),
+                 null_re = data.base %>%
+                   mutate(obs = rnorm(n_labs*n_per_lab, condition*condition_fe.mu, fe.sigma)),
+                 null_fe = data.base %>%
+                   mutate(obs = rnorm(n_labs*n_per_lab, 0, fe.sigma) +
+                            rnorm(n_labs*n_per_lab, condition*condition_re.labs[lab], re.sigma)),
+                 null_none <- data.base %>%
+                   mutate(obs = rnorm(n_labs*n_per_lab, condition*condition_fe.mu, fe.sigma) +
+                            rnorm(n_labs*n_per_lab, condition*condition_re.labs[lab], re.sigma))
+    )
+    ### Run models
+    m.full <- update(model.full, newdata = df, seed = seed)
+    m.A <- update(model.A, newdata = df, seed = seed)
+    m.B <- update(model.B, newdata = df, seed = seed)
+    m.C1 <- update(model.C1, newdata = df, seed = seed)
+    ### Bridge sample
+    bridge.full <- bridge_sampler(m.full, silent = T)
+    bridge.A <- bridge_sampler(m.A, silent = T)
+    bridge.B <- bridge_sampler(m.B, silent = T)
+    bridge.C1 <- bridge_sampler(m.C1, silent = T)
+    ### Bayes factors
+    bf.A <- bayes_factor(bridge.full, bridge.A)$bf
+    bf.B <- bayes_factor(bridge.full, bridge.B)$bf
+    bf.C1 <- bayes_factor(bridge.full, bridge.C1)$bf
+    bf.C2 <- bayes_factor(bridge.C1, bridge.A)$bf
+    ### Combine Bayes factors into tibble with null model information
+    bf <- tribble(
+      ~bf,   ~null_model,
+      bf.A,  "A",
+      bf.B,  "B",
+      bf.C1, "C1",
+      bf.C2, "C2"
+    )
+    return(bf)
+  }
+  ## Create aliases for easier use of purrr::map functions
+  sims.null_both <- function(seed){sims(seed, "null_both")}
+  sims.null_re <- function(seed){sims(seed, "null_re")}
+  sims.null_fe <- function(seed){sims(seed, "null_fe")}
+  sims.null_none <- function(seed){sims(seed, "null_none")}
+  ## Get new Bayes factors
+  ### For data.null_both
+  bf <- future_map_dfr(n_previous + 1:n_sims,
+                       possibly(sims.null_both, NA),
+                       .progress = T)
+  bf %>% mutate(data_structure = "null_both") %>%
+    write_csv(filename.bf, append = file.exists(filename.bf))
+  ### For data.null_re
+  bf <- future_map_dfr(n_previous + 1:n_sims,
+                       possibly(sims.null_re, NA),
+                       .progress = T)
+  bf %>% mutate(data_structure = "null_re") %>%
+    write_csv(filename.bf, append = T)
+  ### For data.null_fe
+  bf <- future_map_dfr(n_previous + 1:n_sims,
+                       possibly(sims.null_fe, NA),
+                       .progress = T)
+  bf %>% mutate(data_structure = "null_fe") %>%
+    write_csv(filename.bf, append = T)
+  ### For data.null_none
+  bf <- future_map_dfr(n_previous + 1:n_sims,
+                       possibly(sims.null_none, NA),
+                       .progress = T)
+  bf %>% mutate(data_structure = "null_none") %>%
+    write_csv(filename.bf, append = T)
+  beep(8)
+}
+t_total <- Sys.time() - t
+## Read Bayes factors
+bf <- read_csv(paste0(save_path, "bayes_factors.csv"))
+```
