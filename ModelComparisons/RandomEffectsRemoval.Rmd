@@ -117,7 +117,7 @@ filename.bf <- paste0(save_path, "bayes_factors.csv")
 # Run bayesian models, bridge-sample, then
 # save bf, parameter estimates, and HPDIs, to csv
 # Running the models takes several hours per iteration
-n_sims <- 8
+n_sims <- 32
 run_models <- T
 if(run_models){
   t <- Sys.time()
@@ -227,7 +227,7 @@ if(run_models){
   beep(8)
 }
 # Read Bayes factors
-#bf <- read_csv(filename.bf)
+bf <- read_csv(filename.bf)
 ```
 
 ## Sample Theory Based simulations and results
