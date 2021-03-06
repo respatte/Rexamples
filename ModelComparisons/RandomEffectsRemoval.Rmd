@@ -117,7 +117,7 @@ filename.bf <- paste0(save_path, "bayes_factors.csv")
 # Run bayesian models, bridge-sample, then
 # save bf, parameter estimates, and HPDIs, to csv
 # Running the models takes several hours per iteration
-n_sims <- 32
+n_sims <- 8
 run_models <- T
 if(run_models){
   t <- Sys.time()
@@ -184,11 +184,11 @@ if(run_models){
     bf.C2 <- bayes_factor(bridge.C1, bridge.A)$bf
     ### Combine Bayes factors into tibble with null model information
     bf <- tribble(
-      ~bf,   ~null_model,
-      bf.A,  "A",
-      bf.B,  "B",
-      bf.C1, "C1",
-      bf.C2, "C2"
+      ~data_structure, ~null_model, ~bf,
+      data.type,       "A",         bf.A,
+      data.type,       "B",         bf.B,
+      data.type,       "C1",        bf.C1,
+      data.type,       "C2",        bf.C2
     )
     return(bf)
   }
@@ -202,26 +202,22 @@ if(run_models){
   bf <- future_map_dfr(n_previous + 1:n_sims,
                        possibly(sims.brms.null_both, NA),
                        .progress = T)
-  bf %>% mutate(data_structure = "null_both") %>%
-    write_csv(filename.bf, append = file.exists(filename.bf))
+  bf %>% write_csv(filename.bf, append = file.exists(filename.bf))
   ### For data.null_re
   bf <- future_map_dfr(n_previous + 1:n_sims,
                        possibly(sims.brms.null_re, NA),
                        .progress = T)
-  bf %>% mutate(data_structure = "null_re") %>%
-    write_csv(filename.bf, append = T)
+  bf %>% write_csv(filename.bf, append = T)
   ### For data.null_fe
   bf <- future_map_dfr(n_previous + 1:n_sims,
                        possibly(sims.brms.null_fe, NA),
                        .progress = T)
-  bf %>% mutate(data_structure = "null_fe") %>%
-    write_csv(filename.bf, append = T)
+  bf %>% write_csv(filename.bf, append = T)
   ### For data.null_none
   bf <- future_map_dfr(n_previous + 1:n_sims,
                        possibly(sims.brms.null_none, NA),
                        .progress = T)
-  bf %>% mutate(data_structure = "null_none") %>%
-    write_csv(filename.bf, append = T)
+  bf %>% write_csv(filename.bf, append = T)
   ## Check run time
   t_total <- Sys.time() - t
   beep(8)
